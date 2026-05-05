@@ -1,0 +1,17 @@
+# Core
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+
+# Azure LLM backend
+openai>=1.0
+
+# Notebook
+notebook>=7.0
+matplotlib>=3.7
+
+# Local LLM backends (optional, GPU required)
+# transformers>=4.40
+# accelerate>=0.27
+# bitsandbytes>=0.41

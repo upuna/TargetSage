@@ -1,0 +1,6 @@
+Gene_Symbol,druggability_score,secreted_probability,membrane_localization,enzyme_activity,kinase_family,gpcr_family,ion_channel,oncogenic_driver,tumor_suppressor,pathway_centrality,clinical_evidence,safety_concern
+EGFR,0.9,0.05,0.95,0.85,0.95,0.02,0.02,0.9,0.02,0.9,0.95,0.2
+PTEN,0.85,0.05,0.7,0.9,0.05,0.05,0.05,0.1,0.95,0.9,0.8,0.2
+IL6,0.9,0.95,0.2,0.05,0.02,0.02,0.02,0.1,0.02,0.85,0.9,0.3
+KRAS,0.9,0.05,0.8,0.85,0.02,0.02,0.02,0.95,0.02,0.9,0.9,0.3
+TP53,0.9,0.05,0.1,0.15,0.02,0.02,0.02,0.85,0.95,0.9,0.8,0.2
