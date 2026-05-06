@@ -54,7 +54,7 @@ _fus_tasks = {
     "Gated": [11.2,3.2,6.5,4.2,14.0,5.4,5.5,24.2,7.8,5.4,13.2,9.1,22.6,17.5,17.2],
 }
 _obj_tasks = {
-    "BCE": [10.4,2.8,3.9,3.3,5.9,1.3,0.5,6.7,4.6,5.0,10.2,7.0,7.5,8.5,8.0],
+    "BCE": [10.3,3.2,5.9,4.4,10.1,3.7,3.7,16.2,6.5,4.9,12.4,8.5,17.5,13.5,14.9],
     "uPU": [9.5,2.9,5.2,4.0,14.1,5.5,4.2,23.6,6.8,4.9,12.7,9.2,22.0,18.0,15.5],
     "nnPU":[11.2,3.2,6.5,4.2,14.0,5.4,5.5,24.2,7.8,5.4,13.2,9.1,22.6,17.5,17.2],
 }
@@ -77,7 +77,7 @@ fig.subplots_adjust(wspace=0.28, left=0.08, right=0.98, top=0.84, bottom=0.29)
 
 bar_panel(axes[0], mod_l, mod_v, highlight_idx=6, title="Feature Modality",  ylabel=True, ylim=(10.4, 11.4))
 bar_panel(axes[1], fus_l, fus_v, highlight_idx=3, title="Fusion Operator",              ylim=(9.3,  11.5))
-bar_panel(axes[2], obj_l, obj_v, highlight_idx=2, title="Learning Objective",           ylim=(4.5,  12.0))
+bar_panel(axes[2], obj_l, obj_v, highlight_idx=2, title="Learning Objective",           ylim=(8.0,  11.8))
 bar_panel(axes[3], rl_l,  rl_v,  highlight_idx=2, title="Attr. Extraction",             ylim=(9.7,  11.5))
 
 for ax, lbl in zip(axes, ["A", "B", "C", "D"]):

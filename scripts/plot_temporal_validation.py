@@ -35,8 +35,8 @@ TDL_COLORS = {
     "Tbio":  "#B8A0D4", "Tdark": "#DDD0EF",
 }
 METHOD_COLORS = {
-    "GeneTrace": "#6E5C7A",
-    "GB":        "#C4B08A",
+    "TargetSage": "#6E5C7A",
+    "GB":         "#C4B08A",
     "RF":        "#9BAE93",
     "LR":        "#8FA5B5",
     "SVM":       "#BC9A8E",
@@ -55,12 +55,12 @@ def normalize_tdl(x):
         str(x).strip().lower(), str(x).strip())
 
 METHOD_LABELS = {
-    "TargetSage_supervised_logits": "GeneTrace",
-    "TargetSage_supervised_calibrated_prob": "GeneTrace",
-    "TargetSage_pu_logits": "GeneTrace",
-    "TargetSage_pu_calibrated_prob": "GeneTrace",
-    "TargetSage": "GeneTrace",
-    "GeneTrace": "GeneTrace",
+    "TargetSage_supervised_logits": "TargetSage",
+    "TargetSage_supervised_calibrated_prob": "TargetSage",
+    "TargetSage_pu_logits": "TargetSage",
+    "TargetSage_pu_calibrated_prob": "TargetSage",
+    "TargetSage": "TargetSage",
+    "GeneTrace": "TargetSage",
     "GB": "GB", "RF_100": "RF", "RF": "RF", "LR": "LR",
     "SVM_RBF": "SVM", "SVM": "SVM",
     "MLP_128_64": "MLP", "MLP": "MLP",

@@ -1,4 +1,4 @@
-# TargetSage: Genome-Wide Drug Target Identification with Agentic LLM Profiling and PU Learning
+# TargetSage: Identifying Therapeutic Target Genes with Interpretable and Robust LLM Reasoning
 
 Three-module framework for prioritizing human protein-coding genes as drug targets across 19,032 genes and 15 benchmark tasks.
 
@@ -9,7 +9,7 @@ M1 — Agentic Profiling
   → features_llm_embedding.csv           (1536-dim text embeddings)
         ↓
 M2 — Guided Reasoning (GRPO)
-  Fine-tunes attribute scorer via RL reward = Adjusted F1
+  Fine-tunes reasoning policy via RL reward = Adjusted F1 of frozen M3 proxy
         ↓
 M3 — PU-Aware Scoring
   ┌─── Bio features          (482-dim)  ─┐

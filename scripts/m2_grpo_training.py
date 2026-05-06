@@ -24,21 +24,30 @@ has access to via head_bio) should produce higher downstream classification
 performance than one that redundantly scores attributes already captured by
 the bio features.
 
-GRPO Reward Function
----------------------
+GRPO Reward Function (Self-Supervised Dynamic Embeddings)
+----------------------------------------------------------
 At each RL step:
   1. Sample a batch of G=4 rollouts per gene.
-  2. For each rollout, substitute the generated attribute vector into the
-     full LLM attribute matrix llm_mat.
-  3. Fit a logistic regression on [bio features || llm_mat] for the
-     labeled gene subset.
-  4. Reward r = Adjusted F1 of that logistic regression = R_soft^2 / p̄
-     (defined in targetsage/metrics.py).
-  5. A penalty factor 0.5x is applied if the reasoning chain is absent or
+  2. For each rollout, substitute the generated attribute vector (scaled via
+     sc_attr) into a copy of the scaled attr matrix Xa_mod.
+  3. With --self_embed (default): extract mean-pooled last-layer hidden states
+     of the GENERATED tokens from the reasoning policy, project via fixed W_proj
+     to 256-dim, and substitute into Xe_mod[gi_batch].  This creates a
+     self-supervised feedback loop: better reasoning → richer LLM hidden states
+     → higher Xe representation quality → higher M3 reward → stronger GRPO signal.
+  4. Pass (Xa_mod, Xe_mod) through each frozen proxy M3 discriminator
+     (pre-trained once on base LLM embeddings before GRPO) via a forward pass.
+  5. Reward r = macro-average Adjusted F1 = mean_t(R_soft_t^2 / p̄_t)
+     across all T=15 tasks.
+  6. A penalty factor 0.5x is applied if the reasoning chain is absent or
      shorter than 30 characters.
 
-The reward is zero-cost: Adjusted F1 on a ~1000-gene subset takes <0.5s
-with sklearn LogisticRegression.
+Key design properties:
+  - M3 proxy models are pre-trained on LLM hidden-state embeddings from the
+    base (pre-GRPO) model so their embedding input distribution is consistent
+    with what they receive during reward evaluation.
+  - W_proj is fixed throughout training: M3 sees a stable emb → latent mapping.
+  - No external API calls are needed for embeddings during GRPO training.
 
 Group Advantage Normalization (GRPO)
 --------------------------------------
@@ -103,12 +112,16 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
-from sklearn.linear_model import LogisticRegression
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+
+from targetsage import TargetSage, nnpu_loss, TASKS, TASK_DISPLAY, load_prior_map
 
 
 # ---------------------------------------------------------------------------
@@ -292,16 +305,11 @@ def attrs_to_vec(attrs):
 
 
 # ---------------------------------------------------------------------------
-# Adjusted F1 reward (local computation, no gradient)
+# Adjusted F1 (metric helper)
 # ---------------------------------------------------------------------------
 
 def adjusted_f1(probs, y):
-    """
-    Compute Adjusted F1 = R_soft^2 / p_bar on a numpy array.
-
-    This is the reward signal for GRPO.  Used inside compute_adj_f1().
-    See targetsage/metrics.py for the full annotated implementation.
-    """
+    """Compute Adjusted F1 = R_soft^2 / p_bar.  See targetsage/metrics.py."""
     pos = y == 1
     if pos.sum() == 0:
         return 0.0
@@ -310,57 +318,209 @@ def adjusted_f1(probs, y):
     return float(R_soft ** 2 / max(p_bar, 1e-10))
 
 
-def compute_adj_f1(X, y, eval_mode="cv"):
+# ---------------------------------------------------------------------------
+# Dynamic implicit embeddings — LLM hidden-state extraction
+# ---------------------------------------------------------------------------
+
+def extract_lm_emb_batch(model, tokenizer, texts, device, W_proj,
+                          max_len=512, batch_size=8):
     """
-    Train a logistic regression on X and return the Adjusted F1 score.
+    Extract mean-pooled last-layer hidden states for a list of text strings and
+    project them to W_proj.shape[1] dimensions via a fixed random projection.
 
-    This function defines the GRPO reward: given a gene-feature matrix X
-    (concatenation of bio features and the current LLM attribute matrix),
-    it trains a logistic regression and evaluates Adjusted F1.
-
-    The idea is that the RL policy (the LLM) is rewarded for generating
-    attribute scores that, when concatenated with the bio features, lead to
-    a better Adjusted F1 score from the downstream logistic regression.
-    This encourages the LLM to generate attributes that COMPLEMENT (not
-    duplicate) the information already in the bio features.
+    This provides a self-supervised implicit embedding of each text that lives
+    in the same space as the M3 reward model's embedding input, enabling
+    per-rollout trace embeddings without any external API calls.
 
     Parameters
     ----------
-    X         : [n_genes, d_bio + d_attrs]  concatenated feature matrix
-    y         : [n_genes]  binary labels (1 = known positive, 0 = unlabeled)
-    eval_mode : 'train' — fit and score on same data (fast, used for RL steps)
-                'cv'    — 5-fold stratified CV (rigorous, used for reporting)
+    texts     : list of str  (gene evidence profiles or reasoning traces)
+    W_proj    : [d_llm, d_emb_proj]  fixed random projection matrix
+    max_len   : maximum token length (longer texts are truncated)
+    batch_size: number of texts processed per forward pass
 
     Returns
     -------
-    float  Adjusted F1 score in [0, 1]
+    np.ndarray  [n, d_emb_proj]  projected embeddings, one row per text
     """
-    try:
-        from sklearn.model_selection import StratifiedKFold
-        Xs = StandardScaler().fit_transform(X)
+    model.eval()
+    all_embs = []
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            enc = tokenizer(
+                batch, return_tensors="pt", padding=True,
+                truncation=True, max_length=max_len,
+            ).to(device)
+            out    = model(**enc, output_hidden_states=True)
+            hidden = out.hidden_states[-1].float()          # [bs, seq, d_llm]
+            mask   = enc["attention_mask"].unsqueeze(-1).float()
+            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)  # [bs, d_llm]
+            all_embs.append(pooled.cpu().numpy() @ W_proj)  # [bs, d_emb_proj]
+    return np.vstack(all_embs)  # [n, d_emb_proj]
 
-        if eval_mode == "train":
-            # Fast mode: fit LR and evaluate on the same data.
-            # Slightly inflated but consistent enough for RL reward comparison.
-            lr = LogisticRegression(max_iter=200, C=1.0, class_weight="balanced",
-                                    solver="lbfgs", random_state=42)
-            lr.fit(Xs, y)
-            prob = lr.predict_proba(Xs)[:, 1]
-            return adjusted_f1(prob, y)
 
-        # Rigorous 5-fold CV mode
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        scores = []
-        for tr_idx, te_idx in skf.split(Xs, y):
-            lr = LogisticRegression(max_iter=200, C=1.0, class_weight="balanced",
-                                    solver="lbfgs", random_state=42)
-            lr.fit(Xs[tr_idx], y[tr_idx])
-            prob_te = lr.predict_proba(Xs[te_idx])[:, 1]
-            scores.append(adjusted_f1(prob_te, y[te_idx]))
-        return float(np.mean(scores))
+# ---------------------------------------------------------------------------
+# M3 pre-training and reward computation
+# ---------------------------------------------------------------------------
 
-    except Exception:
-        return 0.0
+def preprocess_subset(Xb, Xa, Xe, emb_pca_dim=256, seed=42):
+    """
+    Impute missing values, optionally compress embeddings with PCA,
+    and StandardScale all three modalities.  Returns scaled arrays plus
+    sc_attr and sc_emb so new rollout vectors can be scaled consistently.
+    """
+    imp_b = SimpleImputer(strategy="median")
+    imp_a = SimpleImputer(strategy="median")
+    imp_e = SimpleImputer(strategy="median")
+    Xb = imp_b.fit_transform(Xb)
+    Xa = imp_a.fit_transform(Xa)
+    Xe = imp_e.fit_transform(Xe)
+
+    if emb_pca_dim > 0 and Xe.shape[1] > emb_pca_dim:
+        pca = PCA(n_components=min(emb_pca_dim, Xe.shape[1]), random_state=seed)
+        Xe = pca.fit_transform(Xe)
+
+    sc_b = StandardScaler(); sc_a = StandardScaler(); sc_e = StandardScaler()
+    Xb = sc_b.fit_transform(Xb)
+    Xa = sc_a.fit_transform(Xa)
+    Xe = sc_e.fit_transform(Xe)
+
+    return Xb, Xa, Xe, sc_a, sc_e
+
+
+def train_m3_for_reward(Xb, Xa, Xe, y, pi,
+                         device, d_latent=256, head_h=512, dropout=0.2,
+                         warmup_epochs=10, nnpu_epochs=25,
+                         batch_size=512, lr=2e-4, beta=0.6):
+    """
+    Train a TargetSage (Module 3) model on the reward subset using
+    preprocessed bio/attr/emb arrays and the hybrid class prior pi.
+
+    The trained model is returned in eval mode with all gradients disabled —
+    it serves as a frozen reward proxy during GRPO training.
+
+    Parameters
+    ----------
+    Xb, Xa, Xe : [n, d_*]  scaled feature arrays for the subset
+    y           : [n]       binary labels (1 = positive, 0 = unlabeled)
+    pi          : float     hybrid class prior P(Y=1) for this task
+    """
+    model = TargetSage(
+        d_bio=Xb.shape[1], d_attr=Xa.shape[1], d_emb=Xe.shape[1],
+        d_latent=d_latent, head_h=head_h, dropout=dropout, fusion="gated",
+    ).to(device)
+
+    idx_p = np.where(y == 1)[0]
+    idx_u = np.where(y == 0)[0]
+    if len(idx_p) < 10 or len(idx_u) < 10:
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        return model
+
+    # --- Stage 1: BCE warmup ---
+    n_pos, n_unl = len(idx_p), len(idx_u)
+    bce = torch.nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([n_unl / max(n_pos, 1)], device=device)
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    model.train()
+    for _ in range(warmup_epochs):
+        perm = np.random.permutation(len(y))   # re-shuffle every epoch
+        for i in range(0, len(y), batch_size):
+            idx = perm[i:i + batch_size]
+            lp, _, _ = model.forward_logits(
+                torch.from_numpy(Xb[idx]).float().to(device),
+                torch.from_numpy(Xa[idx]).float().to(device),
+                torch.from_numpy(Xe[idx]).float().to(device),
+            )
+            opt.zero_grad()
+            bce(lp, torch.from_numpy(y[idx].astype(np.float32)).to(device)).backward()
+            opt.step()
+
+    # --- Compute semantic weights once (before nnPU loop) ---
+    model.eval()
+    with torch.no_grad():
+        lp_all, _, h_e = model.forward_logits(
+            torch.from_numpy(Xb).float().to(device),
+            torch.from_numpy(Xa).float().to(device),
+            torch.from_numpy(Xe).float().to(device),
+        )
+        prob_all = torch.sigmoid(lp_all)
+        centroid = F.normalize(h_e[idx_p].mean(0, keepdim=True), dim=1)
+        h_u_norm = F.normalize(h_e[idx_u], dim=1)
+        sim_u    = ((h_u_norm * centroid).sum(1) + 1.0) / 2.0
+        w_u = torch.clamp(
+            beta * prob_all[idx_u] + (1 - beta) * sim_u, 0, 1
+        ).cpu().numpy()
+
+    # --- Stage 2: nnPU training ---
+    u_map = {int(idx_u[i]): i for i in range(len(idx_u))}
+    n_batch = max(1, min(len(idx_p), len(idx_u)) // batch_size)
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    for _ in range(nnpu_epochs):
+        for _ in range(n_batch):
+            bp = np.random.choice(idx_p, batch_size, replace=True)
+            bu = np.random.choice(idx_u, batch_size, replace=True)
+            lp_p, _, _ = model.forward_logits(
+                torch.from_numpy(Xb[bp]).float().to(device),
+                torch.from_numpy(Xa[bp]).float().to(device),
+                torch.from_numpy(Xe[bp]).float().to(device),
+            )
+            lp_u, _, _ = model.forward_logits(
+                torch.from_numpy(Xb[bu]).float().to(device),
+                torch.from_numpy(Xa[bu]).float().to(device),
+                torch.from_numpy(Xe[bu]).float().to(device),
+            )
+            w_batch = torch.from_numpy(
+                w_u[[u_map[int(g)] for g in bu]]
+            ).float().to(device)
+            loss = nnpu_loss(lp_p, lp_u, pi=pi, w_u=w_batch)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    # Freeze: no gradients flow through M3 during GRPO training
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+@torch.no_grad()
+def compute_m3_reward(m3_models, Xb, Xa_modified, Xe, y_dict, device):
+    """
+    Compute the macro-averaged Adjusted F1 reward across all tasks by running
+    the modified attribute matrix through each frozen M3 discriminator.
+
+    Parameters
+    ----------
+    m3_models   : dict {task_key: frozen TargetSage model}
+    Xb          : [n, d_bio]  scaled bio features (fixed throughout GRPO)
+    Xa_modified : [n, d_attr] scaled attr matrix with one gene's row substituted
+    Xe          : [n, d_emb]  scaled embeddings (fixed throughout GRPO)
+    y_dict      : dict {task_key: [n] binary labels}
+
+    Returns
+    -------
+    float  macro-average Adjusted F1 across all tasks
+    """
+    Xb_t = torch.from_numpy(Xb).float().to(device)
+    Xa_t = torch.from_numpy(Xa_modified).float().to(device)
+    Xe_t = torch.from_numpy(Xe).float().to(device)
+
+    scores = []
+    for task, m3 in m3_models.items():
+        y = y_dict[task]
+        if y.sum() == 0:
+            continue
+        lp, _, _ = m3.forward_logits(Xb_t, Xa_t, Xe_t)
+        probs = torch.sigmoid(lp).cpu().numpy()
+        scores.append(adjusted_f1(probs, y))
+
+    return float(np.mean(scores)) if scores else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -463,13 +623,36 @@ def main():
                     help="HuggingFace model ID for the local LLM")
     ap.add_argument("--gene_summaries", default="data/gene_summaries.tsv")
     ap.add_argument("--bio_features",   default="data/gene_features.tsv")
+    ap.add_argument("--scores",         default="data/features_llm_structured_scores.csv",
+                    help="Pre-GRPO LLM attribute scores (used to pre-train M3 reward models).")
+    ap.add_argument("--embeddings",     default="data/features_llm_embedding.csv",
+                    help="LLM embedding CSV (required for M3 reward).")
+    ap.add_argument("--prior_csv",      default="data/prior_task_summary.csv",
+                    help="LLM-derived class prior per task (required for M3 nnPU).")
     ap.add_argument("--agent_attrs",    default="results/agent_tools/agent_attributes_filtered.csv")
     ap.add_argument("--labels",         default="data/gene_labels.tsv")
     ap.add_argument("--outdir",         default="results/rl_grpo_v3")
-    ap.add_argument("--task_name",      default="task_pharos_tclin_vs_others",
-                    help="Primary task used to compute the RL reward.")
     ap.add_argument("--n_subset",       type=int,   default=1000,
                     help="Size of the labeled gene subset for reward computation.")
+    ap.add_argument("--emb_pca_dim",    type=int,   default=256,
+                    help="PCA dimension for LLM embeddings before M3.")
+    ap.add_argument("--alpha",          type=float, default=0.6,
+                    help="Hybrid prior mixing coefficient (pi = alpha*pi_data + (1-alpha)*pi_llm).")
+    ap.add_argument("--beta",           type=float, default=0.6,
+                    help="Semantic guidance weight for nnPU soft confidence.")
+    ap.add_argument("--pi_cap",         type=float, default=0.10,
+                    help="Maximum allowed class prior.")
+    ap.add_argument("--m3_warmup",      type=int,   default=10,
+                    help="BCE warmup epochs for M3 pre-training.")
+    ap.add_argument("--m3_nnpu",        type=int,   default=25,
+                    help="nnPU training epochs for M3 pre-training.")
+    ap.add_argument("--self_embed",     action="store_true", default=True,
+                    help="Use LLM last-layer hidden states as implicit embeddings for "
+                         "M3 pre-training and per-rollout GRPO reward (paper-faithful). "
+                         "Pass --no_self_embed to fall back to static OpenAI embeddings.")
+    ap.add_argument("--no_self_embed",  dest="self_embed", action="store_false")
+    ap.add_argument("--lm_proj_seed",   type=int,   default=42,
+                    help="RNG seed for the fixed random W_proj projection matrix.")
     ap.add_argument("--rl_steps",       type=int,   default=100,
                     help="Number of GRPO update steps.")
     ap.add_argument("--rl_lr",          type=float, default=5e-5,
@@ -490,42 +673,55 @@ def main():
     summaries = pd.read_csv(args.gene_summaries, sep="\t")
     labels_df = pd.read_csv(args.labels, sep="\t")
     bio_df    = pd.read_csv(args.bio_features, sep="\t")
+    scores_df = pd.read_csv(args.scores)          # pre-GRPO LLM attr scores (for M3 pre-train)
+    emb_df    = pd.read_csv(args.embeddings)       # LLM embeddings (for M3)
     agent_df  = pd.read_csv(args.agent_attrs)
+    prior_map = load_prior_map(args.prior_csv)     # {display_name: pi_llm}
 
-    # Use the first 5 task columns for multi-task reward (broader signal)
-    tasks = [c for c in labels_df.columns if c.startswith("task_")][:5]
-    print(f"  Tasks: {tasks}")
+    # All 15 tasks used for multi-task M3 reward (macro-avg Adjusted F1)
+    tasks = [c for c in labels_df.columns if c.startswith("task_")]
+    print(f"  Tasks ({len(tasks)}): {tasks}")
 
     # Build lookup dictionaries for gene summaries and agent attributes
     g2s = dict(zip(summaries["Gene_Symbol"].astype(str), summaries["summary"].astype(str)))
     agent_attrs_dict = agent_df.set_index("Gene_Symbol").to_dict("index")
 
-    # Gene universe: intersection of all four data sources
+    # Gene universe: intersection of all data sources
     genes_all = sorted(
         set(g2s.keys())
         & set(labels_df["Gene_Symbol"].astype(str))
         & set(bio_df["Gene_Symbol"].astype(str))
+        & set(scores_df["Gene_Symbol"].astype(str))
+        & set(emb_df["Gene_Symbol"].astype(str))
         & set(agent_df["Gene_Symbol"].astype(str))
     )
     print(f"  Total genes in intersection: {len(genes_all)}")
 
-    # Build bio feature matrix [n_genes, d_bio], filling NaN with 0
-    bio_df = bio_df.set_index("Gene_Symbol")
-    bio_cols = list(bio_df.columns)
-    print(f"  Bio features: {len(bio_cols)} dimensions")
-    bio_df    = bio_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    bio_all   = bio_df.reindex(genes_all).values.astype(float)
-    bio_all   = np.nan_to_num(bio_all, nan=0.0)
-    print(f"  Bio matrix: {bio_all.shape}")
+    # Build raw feature matrices aligned to genes_all
+    bio_df    = bio_df.set_index("Gene_Symbol").apply(pd.to_numeric, errors="coerce")
+    scores_df = scores_df.set_index("Gene_Symbol")
+    emb_df    = emb_df.set_index("Gene_Symbol")
 
-    # ---- Select labeled subset (positives + sampled negatives) ----
-    # We work on a ~1000-gene subset for computational efficiency of the reward.
-    # The subset is ~70% positives + ~30% negatives (or all positives if fewer than 700).
-    task = args.task_name
-    y_all    = labels_df.set_index("Gene_Symbol").reindex(genes_all)[task].values
-    pos_idx  = np.where(y_all == 1)[0]
-    neg_idx  = np.where(y_all == 0)[0]
-    print(f"  Task '{task}': {len(pos_idx)} positive, {len(neg_idx)} negative")
+    attr_cols      = [c for c in scores_df.columns if c in ATTR_VOCAB]
+    attr_col_mask  = np.array([ATTR_VOCAB.index(c) for c in attr_cols])
+    emb_cols       = [c for c in emb_df.columns]
+
+    bio_all  = bio_df.reindex(genes_all).values.astype(float)
+    attr_all = scores_df[attr_cols].reindex(genes_all).values.astype(float)
+    emb_all  = emb_df[emb_cols].reindex(genes_all).values.astype(float)
+    bio_all  = np.nan_to_num(bio_all,  nan=0.0)
+    attr_all = np.nan_to_num(attr_all, nan=0.5)
+    emb_all  = np.nan_to_num(emb_all,  nan=0.0)
+    print(f"  Shapes — bio:{bio_all.shape}  attr:{attr_all.shape}  emb:{emb_all.shape}")
+
+    # ---- Select labeled subset balanced across tasks ----
+    # Use the first task to define positives for subset sampling (Clinical Targets),
+    # then include label columns for all 15 tasks in y_dict_all.
+    labels_idx = labels_df.set_index("Gene_Symbol").reindex(genes_all)
+    anchor_task = tasks[0]  # for stratified sampling
+    y_anchor = labels_idx[anchor_task].fillna(0).values.astype(int)
+    pos_idx  = np.where(y_anchor == 1)[0]
+    neg_idx  = np.where(y_anchor == 0)[0]
 
     np.random.seed(42)
     target_pos = min(len(pos_idx), max(int(args.n_subset * 0.7), 200))
@@ -533,40 +729,44 @@ def main():
     pos_sample = (np.random.choice(pos_idx, size=target_pos, replace=False)
                   if target_pos < len(pos_idx) else pos_idx)
     neg_sample = np.random.choice(neg_idx, size=target_neg, replace=False)
-    subset_idx  = np.concatenate([pos_sample, neg_sample])
+    subset_idx = np.concatenate([pos_sample, neg_sample])
     np.random.shuffle(subset_idx)
 
     subset_genes = [genes_all[i] for i in subset_idx]
-    subset_bio   = bio_all[subset_idx]
-    subset_y     = y_all[subset_idx].astype(int)
-    print(f"  Subset: {len(subset_genes)} genes "
-          f"({subset_y.sum()} pos, {len(subset_y)-subset_y.sum()} neg)")
+    subset_bio_raw  = bio_all[subset_idx]
+    subset_attr_raw = attr_all[subset_idx]   # pre-GRPO scores (for M3 pre-train)
+    subset_emb_raw  = emb_all[subset_idx]
 
-    # Baseline reward: logistic regression on bio features only (no LLM)
-    bio_baseline = compute_adj_f1(subset_bio, subset_y)
-    print(f"  Bio-only baseline Adjusted F1: {bio_baseline*100:.2f}%")
+    # y_dict: binary labels per task for the subset
+    y_dict = {}
+    for t in tasks:
+        if t in labels_idx.columns:
+            y_dict[t] = labels_idx[t].fillna(0).values[subset_idx].astype(int)
+
+    subset_y = y_dict.get(anchor_task, np.zeros(len(subset_idx), dtype=int))
+    print(f"  Subset: {len(subset_genes)} genes "
+          f"({subset_y.sum()} pos in anchor task, {len(subset_y)-subset_y.sum()} neg)")
 
     # ---- Load LLM and apply LoRA ----
+    # Loaded before M3 pre-training so that (when --self_embed) the LLM's last-layer
+    # hidden states serve as the implicit embedding Xe for both M3 pre-training and
+    # per-rollout GRPO reward, creating a fully self-contained dynamic embedding pipeline.
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
 
     print(f"\n[MODEL] Loading {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token  # required for batch padding
-    tokenizer.padding_side = "left"  # causal LM: pad on left for generation
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map=device, trust_remote_code=True
     )
 
     # Apply LoRA: only the adapter weights (~2% of parameters) will be trained.
-    # All attention projection layers and MLP gates are targeted to capture both
-    # retrieval-head and computation-head behavior.
     lora_cfg = LoraConfig(
-        r=32,                # LoRA rank: controls capacity of the adapter
-        lora_alpha=64,       # scaling factor: effective LR = lr * lora_alpha / r
-        lora_dropout=0.05,
+        r=32, lora_alpha=64, lora_dropout=0.05,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
         task_type="CAUSAL_LM",
@@ -586,16 +786,78 @@ def main():
         attrs, reasoning = extract_attrs(t)
         print(f"  [{g}] attrs_parsed={len(attrs)}, has_reasoning={'yes' if reasoning else 'no'}")
 
-    # ---- Initialize LLM attribute matrix ----
-    # llm_mat[i, :] = current best attribute vector for gene subset_genes[i].
-    # Initialized to 0.5 (neutral) before any LLM responses.
-    llm_mat   = np.full((len(subset_genes), len(ATTR_VOCAB)), 0.5)
-    gene2idx  = {g: i for i, g in enumerate(subset_genes)}
+    # ---- Dynamic implicit embeddings: fixed random projection from LLM hidden states ----
+    # W_proj maps LLM last-layer hidden states (dim d_llm) → emb_pca_dim via a fixed
+    # Kaiming-scaled random projection, initialized once before any training.
+    # With --self_embed (default):
+    #   (a) M3 pre-training uses mean-pooled hidden states of gene evidence profiles as Xe,
+    #       so M3 learns to interpret the LLM's internal representation of each gene.
+    #   (b) GRPO reward substitutes Xe[gi_batch] with the mean-pooled hidden states of the
+    #       generated reasoning trace, so both explicit attr scores AND reasoning depth
+    #       jointly shape the reward signal — better reasoning → richer hidden states →
+    #       higher M3 reward → stronger GRPO gradient.
+    d_llm  = model.config.hidden_size
+    W_proj = (np.random.default_rng(args.lm_proj_seed)
+              .standard_normal((d_llm, args.emb_pca_dim))
+              .astype(np.float32) / np.sqrt(d_llm))
 
-    # Initial reward with neutral 0.5 filler (before any training)
-    X_init       = np.concatenate([subset_bio, llm_mat], axis=1)
-    init_reward  = compute_adj_f1(X_init, subset_y)
-    print(f"  Initial reward (bio + 0.5 filler LLM attrs): {init_reward*100:.2f}%")
+    if args.self_embed:
+        print(f"\n[EMBED] Extracting base LLM hidden-state embeddings for "
+              f"{len(subset_genes)} genes (pre-GRPO model)...")
+        subset_profiles = [
+            build_gene_profile(g, g2s, agent_attrs_dict) for g in subset_genes
+        ]
+        emb_for_m3 = extract_lm_emb_batch(
+            model, tokenizer, subset_profiles, device, W_proj,
+            max_len=512, batch_size=8,
+        )
+        print(f"  LLM hidden-state emb shape: {emb_for_m3.shape}")
+    else:
+        emb_for_m3 = subset_emb_raw  # fall back to pre-computed OpenAI embeddings
+
+    # ---- Preprocess subset (impute / PCA / scale) ----
+    # sc_attr and sc_emb are saved so new rollout vectors can be scaled consistently.
+    subset_bio, subset_attr_scaled, subset_emb_scaled, sc_attr, sc_emb = preprocess_subset(
+        subset_bio_raw, subset_attr_raw, emb_for_m3,
+        emb_pca_dim=args.emb_pca_dim, seed=42,
+    )
+
+    # ---- Pre-train one frozen M3 model per task ----
+    print(f"\n[M3] Pre-training frozen M3 reward models for {len(tasks)} tasks...")
+    m3_models = {}
+    for t in tasks:
+        y_t = y_dict.get(t, None)
+        if y_t is None or y_t.sum() < 10:
+            continue
+        display   = TASK_DISPLAY.get(t, t)
+        pi_llm    = prior_map.get(display, float(y_t.mean()))
+        pi_data   = float(y_t.mean())
+        pi_used   = float(np.clip(
+            args.alpha * pi_data + (1 - args.alpha) * pi_llm,
+            float(y_t.mean()), args.pi_cap,
+        ))
+        m3_models[t] = train_m3_for_reward(
+            subset_bio, subset_attr_scaled, subset_emb_scaled, y_t, pi_used,
+            device=device,
+            warmup_epochs=args.m3_warmup, nnpu_epochs=args.m3_nnpu,
+            batch_size=512, lr=2e-4, beta=args.beta,
+        )
+        print(f"  [{display}] pi_used={pi_used:.4f}  M3 ready (frozen)")
+
+    print(f"  M3 models ready: {len(m3_models)} tasks")
+
+    # ---- Initialize LLM attribute matrix ----
+    # llm_mat[i, :] = current best RAW (unscaled) attribute vector for gene subset_genes[i].
+    # Initialized to pre-GRPO LLM scores (subset_attr_raw) as the starting point.
+    # Shape: (n_subset, len(attr_cols))
+    llm_mat  = subset_attr_raw.copy()
+    gene2idx = {g: i for i, g in enumerate(subset_genes)}
+
+    # M3 baseline: reward using pre-GRPO (unoptimized) LLM attr scores + base embeddings
+    m3_baseline = compute_m3_reward(
+        m3_models, subset_bio, subset_attr_scaled, subset_emb_scaled, y_dict, device
+    )
+    print(f"  M3 baseline reward (pre-GRPO attr scores): {m3_baseline*100:.2f}%")
 
     # ---- GRPO training loop ----
     print(f"\n[RL] GRPO: {args.rl_steps} steps, "
@@ -606,7 +868,7 @@ def main():
     )
 
     log         = []
-    best_reward = bio_baseline  # track the best global reward seen
+    best_reward = m3_baseline  # track the best global reward seen
 
     for step in range(args.rl_steps):
         t0 = time.time()
@@ -640,18 +902,40 @@ def main():
             rollouts.append((gi_batch, attrs, reasoning, gen_ids))
 
         # ---- Compute rewards ----
-        # For each rollout, temporarily substitute its attrs into llm_mat,
-        # recompute Adjusted F1 on the full subset, then restore.
+        # For each rollout, build modified attr and (when --self_embed) emb matrices,
+        # then pass through frozen M3 models to get macro-avg Adjusted F1 reward.
         rewards = []
-        for (gi_batch, attrs, reasoning, _) in rollouts:
-            orig_row = llm_mat[gi_batch].copy()
+        for rollout_idx, (gi_batch, attrs, reasoning, gen_ids) in enumerate(rollouts):
+            Xa_mod = subset_attr_scaled.copy()
+            Xe_mod = subset_emb_scaled.copy()
+
             if attrs:
-                llm_mat[gi_batch] = attrs_to_vec(attrs)  # try this rollout's attrs
+                raw_row = attrs_to_vec(attrs)[attr_col_mask]
+                Xa_mod[gi_batch] = sc_attr.transform(raw_row.reshape(1, -1))[0]
 
-            X = np.concatenate([subset_bio, llm_mat], axis=1)
-            r = compute_adj_f1(X, subset_y)  # reward = Adjusted F1 of LR(bio || llm_attrs)
+            if args.self_embed and len(gen_ids) > 0:
+                # Substitute gene gi_batch's embedding row with the mean-pooled
+                # last-layer hidden states of the generated reasoning trace.
+                # This makes the reward sensitive to reasoning quality beyond just
+                # the explicit attribute scores.
+                prompt_i = all_prompts[rollout_idx]
+                enc_i    = tokenizer(
+                    prompt_i, return_tensors="pt", truncation=True, max_length=1536,
+                ).to(device)
+                inp_len  = enc_i["input_ids"].shape[1]
+                full_seq = torch.cat(
+                    [enc_i["input_ids"][0], gen_ids.to(device)]
+                ).unsqueeze(0)
+                with torch.no_grad():
+                    out_h = model(input_ids=full_seq, output_hidden_states=True)
+                    gen_h = out_h.hidden_states[-1][0, inp_len:, :].float()
+                    if gen_h.shape[0] > 0:
+                        trace_proj = gen_h.mean(0).cpu().numpy() @ W_proj
+                        Xe_mod[gi_batch] = sc_emb.transform(
+                            trace_proj.reshape(1, -1)
+                        )[0]
 
-            llm_mat[gi_batch] = orig_row  # restore original (don't commit yet)
+            r = compute_m3_reward(m3_models, subset_bio, Xa_mod, Xe_mod, y_dict, device)
 
             # Penalty for missing or trivial reasoning (length < 30 chars)
             # This encourages the model to produce interpretable reasoning chains.
@@ -731,11 +1015,15 @@ def main():
             best_j   = int(group.argmax())
             best_attrs = rollouts[start + best_j][1]
             if best_attrs:
-                llm_mat[gi_batch] = attrs_to_vec(best_attrs)
+                llm_mat[gi_batch] = attrs_to_vec(best_attrs)[attr_col_mask]
 
         # ---- Global reward on the full subset ----
-        global_X      = np.concatenate([subset_bio, llm_mat], axis=1)
-        global_reward = compute_adj_f1(global_X, subset_y)
+        # Uses base embeddings (not per-rollout trace embeddings) as a stable
+        # reference signal tracking how the committed llm_mat has improved.
+        global_Xa_scaled = sc_attr.transform(llm_mat)
+        global_reward    = compute_m3_reward(
+            m3_models, subset_bio, global_Xa_scaled, subset_emb_scaled, y_dict, device
+        )
 
         # Logging
         mean_r        = rewards.mean()
@@ -747,7 +1035,7 @@ def main():
             "step":          step,
             "mean_reward":   float(mean_r),
             "global_reward": float(global_reward),
-            "bio_baseline":  float(bio_baseline),
+            "m3_baseline":   float(m3_baseline),
             "valid_pct":     float(valid_pct),
             "reasoning_pct": float(reasoning_pct),
             "pg_loss":       float(total_pg_loss / max(n_valid, 1)),
@@ -763,7 +1051,7 @@ def main():
         if step % 2 == 0:
             print(
                 f"  Step {step:3d}: rollout={mean_r*100:.2f}% "
-                f"global={global_reward*100:.2f}% (bio={bio_baseline*100:.2f}%) "
+                f"global={global_reward*100:.2f}% (baseline={m3_baseline*100:.2f}%) "
                 f"valid={valid_pct:.0f}% reas={reasoning_pct:.0f}% "
                 f"loss={total_pg_loss/max(n_valid,1):.4f} {dt:.0f}s"
             )
@@ -774,13 +1062,13 @@ def main():
     # ---- Save final results ----
     pd.DataFrame(log).to_csv(os.path.join(args.outdir, "rl_log.csv"), index=False)
 
-    print(f"\n[DONE] Bio-only baseline:  {bio_baseline*100:.2f}%")
-    print(f"       Best RL reward:     {best_reward*100:.2f}%")
-    print(f"       Improvement:        +{(best_reward - bio_baseline)*100:.2f}%")
+    print(f"\n[DONE] M3 baseline (pre-GRPO): {m3_baseline*100:.2f}%")
+    print(f"       Best RL reward:        {best_reward*100:.2f}%")
+    print(f"       Improvement:           +{(best_reward - m3_baseline)*100:.2f}%")
 
     # Save the final LLM attribute matrix (used as input to TargetSage M3)
     np.save(os.path.join(args.outdir, "llm_attrs_subset.npy"), llm_mat)
-    pd.DataFrame(llm_mat, columns=ATTR_VOCAB, index=subset_genes).to_csv(
+    pd.DataFrame(llm_mat, columns=attr_cols, index=subset_genes).to_csv(
         os.path.join(args.outdir, "llm_attrs_subset.csv")
     )
     print(f"       Saved to {args.outdir}/")
