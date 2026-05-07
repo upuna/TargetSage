@@ -137,16 +137,16 @@ Macro-average Adjusted F1 over 15 tasks and 5 random seeds (Table 1 of the paper
 
 | Method | Macro Adjusted F1 |
 |--------|------------------|
-| TargetSage (this code) | **11.1%** |
-| ResNet (best deep tabular) | 8.1% |
-| Gradient Boosting (best classical) | 7.6% |
-| FT-Transformer | 6.7% |
-| Logistic Regression | 6.0% |
-| MLP (sklearn) | 6.0% |
-| TabNet | 5.1% |
-| SVM | 3.3% |
-| KNN | 3.7% |
-| Naive Bayes | 1.6% |
+| TargetSage (this code) | **11.1** |
+| ResNet (best deep tabular) | 8.1 |
+| Gradient Boosting (best classical) | 7.6 |
+| FT-Transformer | 6.7 |
+| Logistic Regression | 6.0 |
+| MLP (sklearn) | 6.0 |
+| TabNet | 5.1 |
+| SVM | 3.3 |
+| KNN | 3.7 |
+| Naive Bayes | 1.6 |
 
 Variance across seeds is typically ±0.3–1.2% depending on the task.  Tasks with very few known positives (e.g., T1 Cancer targets, |P|<100) show higher variance.
 
