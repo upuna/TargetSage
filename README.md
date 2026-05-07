@@ -118,13 +118,13 @@ Macro-average Adjusted F1 over 15 tasks and 5 seeds:
 
 | Method | Macro Adjusted F1 |
 |--------|------------------|
-| **TargetSage** | **11.1%** |
-| ResNet | 8.1% |
-| Gradient Boosting | 7.6% |
-| FT-Transformer | 6.7% |
-| Logistic Regression | 6.0% |
-| MLP | 6.0% |
-| TabNet | 5.1% |
-| KNN | 3.7% |
-| SVM | 3.3% |
-| Naive Bayes | 1.6% |
+| **TargetSage** | **11.1** |
+| ResNet | 8.1 |
+| Gradient Boosting | 7.6 |
+| FT-Transformer | 6.7 |
+| Logistic Regression | 6.0 |
+| MLP | 6.0 |
+| TabNet | 5.1 |
+| KNN | 3.7 |
+| SVM | 3.3 |
+| Naive Bayes | 1.6 |
