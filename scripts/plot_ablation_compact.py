@@ -30,7 +30,7 @@ def bar_panel(ax, labels, values, highlight_idx, title, ylabel=False, ylim=(9.5,
     ax.set_xlim(-0.6, len(labels) - 0.4)
     ax.set_ylim(*ylim)
     if ylabel:
-        ax.set_ylabel("Macro-avg Adj. F1 (%)", fontsize=7.5)
+        ax.set_ylabel("Macro-avg Adj. F1", fontsize=7.5)
     ax.tick_params(axis="y", labelsize=6.5)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
