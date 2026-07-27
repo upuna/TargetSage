@@ -47,9 +47,11 @@ Semantic Reweighting
 TargetSage extends nnPU with per-sample weights w_j on the unlabeled set.
 The weighted unlabeled risk becomes:
 
-    R_U^-(w) = Σ_j w_j · ℓ(f(x_j), 0) / Σ_j w_j
+    R_U^-(w) = Σ_j (1-w_j) · ℓ(f(x_j), 0) / Σ_j (1-w_j)
 
 where w_j = β · sigmoid(D(z_j)) + (1-β) · cos(h_e_j, centroid_pos).
+A gene resembling known positives has a high w_j and therefore a small (1-w_j)
+weight in the unlabeled negative risk, i.e. it is spared harsh penalization.
 See train.py::train_nnpu() for the full implementation.
 
 Hybrid Class Prior
@@ -150,9 +152,11 @@ def nnpu_loss(
     # R_U^-(w) : (optionally weighted) loss on unlabeled samples
     Lu = logistic_loss(logits_u, y0_u)
     if w_u is not None:
-        # Weighted mean: ensures high-weight unlabeled genes contribute more
-        # (weights encode semantic similarity to known positives)
-        Ru_neg = (Lu * w_u).sum() / (w_u.sum() + 1e-8)
+        # Weighted mean with (1 - w_u): unlabeled genes that most resemble known
+        # positives (high w_u) get the SMALLEST negative weight, so likely hidden
+        # positives are not penalized hard for receiving a high score; genes
+        # dissimilar to positives (low w_u) are treated as reliable negatives.
+        Ru_neg = (Lu * (1.0 - w_u)).sum() / ((1.0 - w_u).sum() + 1e-8)
     else:
         Ru_neg = Lu.mean()
 
